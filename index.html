@@ -44,6 +44,8 @@ canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor
     <button class="sec" id="gps">Usar mi ubicación</button>
     <button id="go">Calcular panorama</button>
     <button class="sec" id="camb">Modo cámara</button>
+    <button class="sec" id="rp">Reintentar picos</button>
+    <label class="btn sec">Picos CSV<input id="csv" type="file" accept=".csv,.txt" hidden></label>
   </div>
   <div id="msg">Carga uno o más GeoTIFF en coordenadas geográficas (EPSG:4326 o equivalente).</div>
 </details>
@@ -156,15 +158,41 @@ function rayoMax(az,dmax,z0){
 }
 
 /* ---------- Picos con nombre (OpenStreetMap) ---------- */
+const OVERPASS=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter','https://maps.mail.ru/osm/tools/overpass/api/interpreter'];
+let zObs=0, picosCsv=null;
+async function overpass(q){                              // prueba cada servidor hasta que uno responda
+  let ult;
+  for(const u of OVERPASS){
+    try{
+      const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body:'data='+encodeURIComponent(q),signal:AbortSignal.timeout(35000)});
+      if(!r.ok) throw new Error(new URL(u).hostname+' respondió '+r.status);
+      return (await r.json()).elements;
+    }catch(e){ ult=e; msg('Reintentando con otro servidor… ('+e.message+')'); }
+  }
+  throw ult;
+}
+// CSV opcional con columnas: nombre, lat, lon y (opcional) elev. Separador coma o punto y coma.
+$('csv').onchange=async e=>{
+  const f=e.target.files[0]; if(!f) return;
+  const L=(await f.text()).split(/\r?\n/).filter(Boolean), sep=L[0].includes(';')?';':',';
+  const h=L[0].toLowerCase().split(sep).map(s=>s.trim()), ix=k=>h.findIndex(x=>k.some(y=>x.startsWith(y)));
+  const iN=ix(['nom','name']), iA=ix(['lat']), iO=ix(['lon','lng']), iE=ix(['ele','alt']);
+  if(iN<0||iA<0||iO<0) return msg('El CSV necesita las columnas nombre, lat y lon (elev es opcional).');
+  picosCsv=L.slice(1).map(l=>l.split(sep)).map(c=>({lat:+c[iA],lon:+c[iO],tags:{name:(c[iN]||'').trim(),ele:iE>=0?c[iE]:''}}))
+    .filter(p=>isFinite(p.lat)&&isFinite(p.lon)&&p.tags.name);
+  msg(`${picosCsv.length} picos cargados del CSV.`); if(P&&sky) cargarPicos(zObs);
+};
+$('rp').onclick=()=>{ if(P&&sky) cargarPicos(zObs); else msg('Primero calcula el panorama.'); };
 async function cargarPicos(z0){
   peaks=[];
   try{
     const q=`[out:json][timeout:40];node["natural"~"^(peak|volcano)$"]["name"](around:${P.D},${P.lat},${P.lon});out body 2500;`;
-    const r=await fetch('https://overpass-api.de/api/interpreter',{method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'data='+encodeURIComponent(q)});
-    if(!r.ok) throw new Error('Overpass respondió '+r.status);
+    msg(picosCsv?'Usando picos del CSV…':'Buscando picos en OpenStreetMap…');
+    const lista=picosCsv||await overpass(q);
     const ds=Math.max(30,P.cell);
-    for(const e of (await r.json()).elements){
+    for(const e of lista){
       const dx=(e.lon-P.lon)*P.mLon, dy=(e.lat-P.lat)*P.mLat, d=Math.hypot(dx,dy);
       if(d<400||d>P.D) continue;
       const gx=Math.round((e.lon-P.west)/P.cLon), gy=Math.round((P.north-e.lat)/P.cLat);
@@ -176,7 +204,7 @@ async function cargarPicos(z0){
     }
     peaks.sort((a,b)=>b.ele-a.ele);
     msg(`Panorama listo · ${peaks.length} picos visibles · cobertura DEM ${Math.round(P.cov*100)} %`);
-  }catch(err){ msg('Panorama listo, pero no se pudieron cargar los nombres de picos: '+err.message); }
+  }catch(err){ msg('Panorama listo, pero no se pudieron cargar los picos ('+err.message+'). Pulsa «Reintentar picos» o carga un CSV.'); }
   dibujar();
 }
 
@@ -190,7 +218,7 @@ $('go').onclick=async()=>{
     if(cov<0.05) throw new Error('Los DEM cargados no cubren esa coordenada.');
     msg('Calculando horizonte…'); await tick();
     const alt=$('alt').value, z0=alt!==''?+alt:zAt(P.cx,P.cy)+2;
-    panorama(z0); dibujar();
+    zObs=z0; panorama(z0); dibujar();
     msg('Buscando picos en OpenStreetMap…'); await cargarPicos(z0);
   }catch(e){ msg('Error: '+e.message); }
   $('go').disabled=false;
@@ -255,16 +283,20 @@ function dibujar(){
 }
 
 /* ---------- Modo cámara (realidad aumentada) ---------- */
-let cam=false, sensor=false, stream=null, Rs=null, offI=null, myaw=0, mpitch=0, evName='';
+let cam=false, sensor=false, stream=null, Rs=null, offI=null, myaw=0, mpitch=0, fuente='', t0=0, nA=0, nR=0;
 function rumboDeCamara(al,be,ga){
   const cA=Math.cos(rad(al)),sA=Math.sin(rad(al)),cB=Math.cos(rad(be)),sB=Math.sin(rad(be)),cG=Math.cos(rad(ga)),sG=Math.sin(rad(ga));
   return mod(deg(Math.atan2(-cA*sG-sA*sB*cG,-sA*sG+cA*sB*cG)));
 }
 // Matriz de rotación dispositivo→Tierra (E,N,arriba) a partir de los ángulos de Euler del W3C; se suaviza y se reortonormaliza
 function fijaOri(al,be,ga){
-  al-=+$('hoff').value;
   const cA=Math.cos(rad(al)),sA=Math.sin(rad(al)),cB=Math.cos(rad(be)),sB=Math.sin(rad(be)),cG=Math.cos(rad(ga)),sG=Math.sin(rad(ga));
   const R=[cA*cG-sA*sB*sG,-sA*cB,cA*sG+sA*sB*cG, sA*cG+cA*sB*sG,cA*cB,sA*sG-cA*sB*cG, -cB*sG,sB,cB*cG];
+  fijaR(R);
+}
+function fijaR(R){
+  const o=rad(+$('hoff').value), co=Math.cos(o), so=Math.sin(o);   // giro del rumbo sobre la vertical
+  for(let j=0;j<3;j++){ const e=R[j], n=R[3+j]; R[j]=co*e+so*n; R[3+j]=-so*e+co*n; }
   if(!Rs) Rs=R; else for(let i=0;i<9;i++) Rs[i]=Rs[i]*0.75+R[i]*0.25;
   let c3=[Rs[2],Rs[5],Rs[8]], c2=[Rs[1],Rs[4],Rs[7]];
   const n3=Math.hypot(...c3); c3=c3.map(v=>v/n3);
@@ -274,7 +306,15 @@ function fijaOri(al,be,ga){
   Rs=[c1[0],c2[0],c3[0],c1[1],c2[1],c3[1],c1[2],c2[2],c3[2]];
 }
 function alOrientar(e){
+  if(e.type==='deviceorientationabsolute') nA++; else nR++;
   let a=e.alpha; if(a==null||e.beta==null) return;
+  const absol=e.webkitCompassHeading!=null||e.absolute||e.type==='deviceorientationabsolute';
+  if(absol) fuente='absoluto';
+  else{                                                   // relativo: solo si en 2.5 s no llegó ninguno absoluto
+    if(fuente&&fuente!=='relativo') return;
+    if(Date.now()-t0<2500) return;
+    if(fuente!=='relativo'){ fuente='relativo'; $('hoff').min=-180; $('hoff').max=180; $('hoff').step=1; }
+  }
   if(e.webkitCompassHeading!=null){                       // iOS: alpha es relativo, se ancla a la brújula
     const dl=wrap(e.webkitCompassHeading-rumboDeCamara(a,e.beta,e.gamma));
     offI=offI===null?dl:offI+0.1*wrap(dl-offI); a-=offI;
@@ -291,13 +331,14 @@ async function iniciarCam(){
   }catch(e){ return msg('Cámara o sensores: '+e.message+' (hace falta HTTPS o localhost)'); }
   $('vid').srcObject=stream; $('vid').style.display='block'; $('camui').hidden=false; $('zoom').style.display='none';
   $('panel').open=false; cam=true; sensor=false; Rs=null; offI=null;
-  evName='ondeviceorientationabsolute' in window?'deviceorientationabsolute':'deviceorientation';
-  addEventListener(evName,alOrientar,true);
-  setTimeout(()=>{ if(cam&&!sensor){ myaw=mod(yaw); mpitch=0; Rs=null; fijaOri(360-myaw,90,0); } },1500);   // sin sensores: modo manual
+  fuente=''; t0=Date.now(); nA=0; nR=0;
+  if('ondeviceorientationabsolute' in window) addEventListener('deviceorientationabsolute',alOrientar,true);
+  addEventListener('deviceorientation',alOrientar,true);
+  setTimeout(()=>{ if(cam&&!sensor){ myaw=mod(yaw); mpitch=0; Rs=null; fijaOri(360-myaw,90,0); } },3500);   // sin sensores: modo manual
   (function bucle(){ if(!cam) return; dibujarAR(); requestAnimationFrame(bucle); })();
 }
 function salirCam(){
-  cam=false; removeEventListener(evName,alOrientar,true);
+  cam=false; removeEventListener('deviceorientationabsolute',alOrientar,true); removeEventListener('deviceorientation',alOrientar,true);
   stream?.getTracks().forEach(t=>t.stop()); stream=null;
   $('vid').style.display='none'; $('camui').hidden=true; $('zoom').style.display=''; $('panel').open=true; dibujar();
 }
@@ -351,9 +392,10 @@ function dibujarAR(){
     ctx.fillText(p.ele+' m · '+(p.d/1000).toFixed(0)+' km',6+ctx.measureText(nom).width*1.25+4,-3);
     ctx.restore();
   }
-  ctx.shadowBlur=0; ctx.fillStyle='rgba(20,20,22,.7)'; ctx.fillRect(8,8,sensor?205:300,24);
-  ctx.fillStyle='#fff'; ctx.font='12px system-ui';
-  ctx.fillText(sensor?`Rumbo ${Math.round(mod(camAz))}° · inclinación ${Math.round(pitch)}°`:'Sin sensores: arrastra para orientar la vista',14,25);
+  const txt=sensor?`Rumbo ${Math.round(mod(camAz))}° · incl. ${Math.round(pitch)}°`+(fuente==='relativo'?' · sin brújula: usa el ajuste de rumbo':'')
+    :`Sin sensores (eventos abs ${nA}, rel ${nR}): arrastra para orientar`;
+  ctx.shadowBlur=0; ctx.font='12px system-ui'; ctx.fillStyle='rgba(20,20,22,.7)'; ctx.fillRect(8,8,ctx.measureText(txt).width+12,24);
+  ctx.fillStyle='#fff'; ctx.fillText(txt,14,25);
 }
 
 /* ---------- Interacción: arrastre, rueda, pellizco y teclado ---------- */
