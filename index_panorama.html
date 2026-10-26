@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Panorama de relieve</title>
+<style>
+:root{--bg:#1b1b1d;--pn:#262629;--ln:#3a3a3f;--fg:#ececec;--mut:#9a9aa2;--ac:#f2c200}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.35 "Segoe UI",system-ui,sans-serif;display:flex;flex-direction:column}
+details{background:var(--pn);border-bottom:1px solid var(--ln);padding:6px 12px calc(6px + env(safe-area-inset-top))}
+summary{cursor:pointer;font-weight:600;padding:4px 0}
+.fila{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:end;padding:6px 0}
+label{display:flex;flex-direction:column;font-size:12px;color:var(--mut);gap:2px}
+input,select{background:#161618;color:var(--fg);border:1px solid var(--ln);border-radius:6px;padding:6px 8px;font:inherit;width:112px}
+input[type=range]{width:110px;padding:0}
+button,label.btn{background:var(--ac);color:#1a1500;border:0;border-radius:6px;padding:8px 12px;font:inherit;font-weight:600;cursor:pointer;flex-direction:row}
+button.sec,label.btn.sec{background:transparent;color:var(--fg);border:1px solid var(--ln)}
+button:disabled{opacity:.5}
+#msg{font-size:12px;color:var(--mut);min-height:16px}
+#wrap{flex:1;position:relative;min-height:0}
+canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor:grab}
+#zoom{position:absolute;left:10px;top:10px;display:flex;flex-direction:column;gap:8px}
+#zoom button{width:42px;height:42px;border-radius:50%;background:rgba(20,20,22,.85);color:#fff;font-size:22px;padding:0}
+#vid{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:none;background:#000}
+#camui{position:absolute;left:8px;right:8px;bottom:calc(8px + env(safe-area-inset-bottom));display:flex;flex-wrap:wrap;gap:8px 14px;align-items:end;background:rgba(20,20,22,.72);padding:8px 10px;border-radius:10px}
+#camui[hidden]{display:none}
+</style>
+</head>
+<body>
+<details open id="panel">
+  <summary>Observador y datos</summary>
+  <div class="fila">
+    <label>Latitud<input id="lat" type="number" step="any" value="19.4326"></label>
+    <label>Longitud<input id="lon" type="number" step="any" value="-99.1332"></label>
+    <label>Altitud (m)<input id="alt" type="number" step="any" placeholder="terreno + 2 m"></label>
+    <label>Alcance<select id="rad"><option value="50">50 km</option><option value="100" selected>100 km</option><option value="150">150 km</option><option value="200">200 km</option></select></label>
+    <label>Celda<select id="cel"><option>30</option><option selected>60</option><option>90</option><option>150</option></select></label>
+    <label>Exageración vertical<input id="exa" type="range" min="1" max="8" step="0.5" value="3"></label>
+  </div>
+  <div class="fila">
+    <label class="btn sec">Cargar DEM (.tif)<input id="dem" type="file" multiple accept=".tif,.tiff" hidden></label>
+    <button class="sec" id="gps">Usar mi ubicación</button>
+    <button id="go">Calcular panorama</button>
+    <button class="sec" id="camb">Modo cámara</button>
+  </div>
+  <div id="msg">Carga uno o más GeoTIFF en coordenadas geográficas (EPSG:4326 o equivalente).</div>
+</details>
+<div id="wrap">
+  <video id="vid" playsinline muted autoplay></video>
+  <canvas id="cv"></canvas>
+  <div id="camui" hidden>
+    <label>Campo de visión vertical<input id="fov" type="range" min="40" max="90" step="1" value="63"></label>
+    <label>Ajuste de rumbo<input id="hoff" type="range" min="-30" max="30" step="0.5" value="0"></label>
+    <button class="sec" id="salir">Salir de cámara</button>
+  </div>
+  <div id="zoom"><button id="zi">+</button><button id="zo">−</button></div>
+</div>
+
+<script src="https://unpkg.com/geotiff@2.1.3/dist-browser/geotiff.js"></script>
+<script>
+const $=id=>document.getElementById(id), rad=d=>d*Math.PI/180, deg=r=>r*180/Math.PI;
+const wrap=a=>((a+540)%360)-180, mod=a=>((a%360)+360)%360, clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
+const KREF=(1-0.13)/(2*6371000);          // curvatura terrestre con refracción k=0.13
+const STEP=0.1, N=3600;                   // resolución angular: 0.1° por columna
+const MARCAS=[['N',0],['NE',45],['E',90],['SE',135],['S',180],['SO',225],['O',270],['NO',315]];
+let files=[], g=null, P=null, sky=null, edges=[], peaks=[], Amax=1;
+let yaw=0, fov=60, offY=0;
+const msg=t=>$('msg').textContent=t, tick=()=>new Promise(r=>setTimeout(r,15));
+
+/* ---------- Carga de DEM ---------- */
+$('dem').onchange=async e=>{
+  files=[];
+  for(const f of e.target.files){
+    try{
+      const im=await (await GeoTIFF.fromBlob(f)).getImage();
+      if(im.getGeoKeys().ProjectedCSTypeGeoKey){
+        msg(`${f.name} está en coordenadas proyectadas. Reproyecta a geográficas: gdalwarp -t_srs EPSG:4326`); continue;
+      }
+      const [ox,oy]=im.getOrigin(), [rx,ry]=im.getResolution();
+      files.push({name:f.name,im,ox,oy,rx,ry:Math.abs(ry),w:im.getWidth(),h:im.getHeight(),nd:im.getGDALNoData()});
+    }catch(err){ msg(`No pude abrir ${f.name}: ${err.message}`); }
+  }
+  if(files.length) msg(`${files.length} archivo(s) DEM listo(s).`);
+};
+$('gps').onclick=()=>navigator.geolocation?.getCurrentPosition(p=>{
+  $('lat').value=p.coords.latitude.toFixed(5); $('lon').value=p.coords.longitude.toFixed(5);
+  if(p.coords.altitude!=null) $('alt').value=Math.round(p.coords.altitude);
+},e=>msg('Ubicación: '+e.message),{enableHighAccuracy:true});
+
+/* ---------- Malla local de elevaciones (celda cuadrada en metros) ---------- */
+async function construirGrid(lat,lon,D,cell){
+  const mLat=111320, mLon=mLat*Math.cos(rad(lat)), cLat=cell/mLat, cLon=cell/mLon;
+  const n=Math.ceil(2*D/cell);
+  const west=lon-D/mLon, east=lon+D/mLon, north=lat+D/mLat, south=lat-D/mLat;
+  const grid=new Float32Array(n*n).fill(NaN);
+  for(const f of files){
+    const iw=Math.max(west,f.ox), ie=Math.min(east,f.ox+f.w*f.rx);
+    const it=Math.min(north,f.oy), ib=Math.max(south,f.oy-f.h*f.ry);
+    if(iw>=ie||ib>=it) continue;
+    const x0=Math.max(0,Math.floor((iw-f.ox)/f.rx)), x1=Math.min(f.w,Math.ceil((ie-f.ox)/f.rx));
+    const y0=Math.max(0,Math.floor((f.oy-it)/f.ry)), y1=Math.min(f.h,Math.ceil((f.oy-ib)/f.ry));
+    const fx=f.rx/cLon, fy=f.ry/cLat;
+    const dx0=(f.ox+x0*f.rx-west)/cLon, dy0=(north-(f.oy-y0*f.ry))/cLat;
+    const outW=Math.round(dx0+(x1-x0)*fx)-Math.round(dx0), c0=Math.round(dx0);
+    if(outW<1) continue;
+    const CH=Math.max(64,Math.floor(4e6/(x1-x0)));          // lectura por bloques de ~4 millones de píxeles
+    for(let a=y0;a<y1;a+=CH){
+      const b=Math.min(y1,a+CH), r0=Math.round(dy0+(a-y0)*fy), outH=Math.round(dy0+(b-y0)*fy)-r0;
+      if(outH<1) continue;
+      const px=(await f.im.readRasters({window:[x0,a,x1,b],width:outW,height:outH,samples:[0],interleave:false}))[0];
+      for(let r=0;r<outH;r++){
+        const gy=r0+r; if(gy<0||gy>=n) continue;
+        for(let c=0;c<outW;c++){
+          const gx=c0+c; if(gx<0||gx>=n) continue;
+          const v=px[r*outW+c]; if(v===f.nd||v<-1000||v!==v) continue;
+          grid[gy*n+gx]=v;
+        }
+      }
+      msg(`Leyendo ${f.name}: ${Math.round((b-y0)/(y1-y0)*100)} %`); await tick();
+    }
+  }
+  let vacias=0; for(let i=0;i<grid.length;i++) if(grid[i]!==grid[i]){vacias++;grid[i]=0;}
+  g=grid;
+  P={n,cell,lat,lon,D,mLat,mLon,cLat,cLon,west,north,cx:(lon-west)/cLon,cy:(north-lat)/cLat};
+  return 1-vacias/grid.length;
+}
+function zAt(x,y){                                   // interpolación bilineal
+  const n=P.n; if(x<0||y<0||x>=n-1||y>=n-1) return 0;
+  const i=x|0,j=y|0,fx=x-i,fy=y-j,k=j*n+i;
+  return g[k]*(1-fx)*(1-fy)+g[k+1]*fx*(1-fy)+g[k+n]*(1-fx)*fy+g[k+n+1]*fx*fy;
+}
+
+/* ---------- Trazado de rayos: horizonte por bandas de distancia ---------- */
+function panorama(z0){
+  const D=P.D, ds=Math.max(30,P.cell), cell=P.cell;
+  edges=[1000,3000,6000,12000,25000,50000,100000,200000].filter(e=>e<D); edges.push(D);
+  const nb=edges.length; sky=edges.map(()=>new Float32Array(N));
+  for(let i=0;i<N;i++){
+    const a=rad(i*STEP), sx=Math.sin(a)/cell, cy=Math.cos(a)/cell;
+    let mt=-1e9, b=0;
+    for(let d=ds;d<=D;d+=ds){
+      const t=(zAt(P.cx+d*sx,P.cy-d*cy)-z0-KREF*d*d)/d;
+      if(t>mt) mt=t;
+      if(d>=edges[b]){ sky[b][i]=deg(Math.atan(mt)); if(++b>=nb) break; }
+    }
+    for(;b<nb;b++) sky[b][i]=deg(Math.atan(mt));
+  }
+  Amax=Math.max(0.5,...sky[nb-1]);
+}
+function rayoMax(az,dmax,z0){
+  const ds=Math.max(30,P.cell), sx=Math.sin(az)/P.cell, cy=Math.cos(az)/P.cell; let mt=-1e9;
+  for(let d=ds;d<=dmax;d+=ds){ const t=(zAt(P.cx+d*sx,P.cy-d*cy)-z0-KREF*d*d)/d; if(t>mt) mt=t; }
+  return mt;
+}
+
+/* ---------- Picos con nombre (OpenStreetMap) ---------- */
+async function cargarPicos(z0){
+  peaks=[];
+  try{
+    const q=`[out:json][timeout:40];node["natural"~"^(peak|volcano)$"]["name"](around:${P.D},${P.lat},${P.lon});out body 2500;`;
+    const r=await fetch('https://overpass-api.de/api/interpreter',{method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'data='+encodeURIComponent(q)});
+    if(!r.ok) throw new Error('Overpass respondió '+r.status);
+    const ds=Math.max(30,P.cell);
+    for(const e of (await r.json()).elements){
+      const dx=(e.lon-P.lon)*P.mLon, dy=(e.lat-P.lat)*P.mLat, d=Math.hypot(dx,dy);
+      if(d<400||d>P.D) continue;
+      const gx=Math.round((e.lon-P.west)/P.cLon), gy=Math.round((P.north-e.lat)/P.cLat);
+      let zp=-1e9;                                       // máximo en 3×3 para no perder la cima por el remuestreo
+      for(let j=-1;j<=1;j++) for(let i=-1;i<=1;i++) zp=Math.max(zp,zAt(gx+i,gy+j));
+      const az=Math.atan2(dx,dy), tp=(zp-z0-KREF*d*d)/d;
+      if(tp<rayoMax(az,d-3*ds,z0)-0.0006) continue;       // oculto detrás de otro relieve
+      peaks.push({az:mod(deg(az)),ang:deg(Math.atan(tp)),nombre:e.tags.name,ele:Math.round(parseFloat(e.tags.ele)||zp),d});
+    }
+    peaks.sort((a,b)=>b.ele-a.ele);
+    msg(`Panorama listo · ${peaks.length} picos visibles · cobertura DEM ${Math.round(P.cov*100)} %`);
+  }catch(err){ msg('Panorama listo, pero no se pudieron cargar los nombres de picos: '+err.message); }
+  dibujar();
+}
+
+$('go').onclick=async()=>{
+  const lat=+$('lat').value, lon=+$('lon').value, D=+$('rad').value*1000, cell=+$('cel').value;
+  if(!files.length) return msg('Primero carga uno o más archivos DEM.');
+  if(!isFinite(lat)||!isFinite(lon)) return msg('Coordenadas no válidas.');
+  $('go').disabled=true;
+  try{
+    const cov=await construirGrid(lat,lon,D,cell); P.cov=cov;
+    if(cov<0.05) throw new Error('Los DEM cargados no cubren esa coordenada.');
+    msg('Calculando horizonte…'); await tick();
+    const alt=$('alt').value, z0=alt!==''?+alt:zAt(P.cx,P.cy)+2;
+    panorama(z0); dibujar();
+    msg('Buscando picos en OpenStreetMap…'); await cargarPicos(z0);
+  }catch(e){ msg('Error: '+e.message); }
+  $('go').disabled=false;
+};
+
+/* ---------- Dibujo ---------- */
+const cv=$('cv'), ctx=cv.getContext('2d');
+function skyAt(arr,az){ const c=mod(az)/STEP, i=Math.floor(c), f=c-i; return arr[i%N]+(arr[(i+1)%N]-arr[i%N])*f; }
+const lerp=(a,b,t)=>Math.round(a+(b-a)*t);
+function dibujar(){
+  if(cam){ dibujarAR(); return; }
+  const dpr=devicePixelRatio||1, W=cv.clientWidth, H=cv.clientHeight;
+  if(cv.width!==Math.round(W*dpr)||cv.height!==Math.round(H*dpr)){cv.width=Math.round(W*dpr);cv.height=Math.round(H*dpr);}
+  ctx.setTransform(dpr,0,0,dpr,0,0); ctx.fillStyle='#1b1b1d'; ctx.fillRect(0,0,W,H);
+  if(!sky){ ctx.fillStyle='#9a9aa2'; ctx.font='15px system-ui'; ctx.textAlign='center';
+    ctx.fillText('Carga un DEM y pulsa «Calcular panorama»',W/2,H/2); return; }
+  const ppd=W/fov, pv=Math.min(ppd*+$('exa').value,0.36*H/Amax), y0=0.7*H+offY, az0=yaw-fov/2, nb=sky.length;
+  const yOf=a=>y0-a*pv;
+  ctx.lineJoin='round';
+  for(let b=nb-1;b>=0;b--){                                  // de lo lejano a lo cercano
+    const t=b/Math.max(1,nb-1), line=new Path2D();
+    for(let x=0;x<=W;x+=2){ const y=yOf(skyAt(sky[b],az0+x/ppd)); x?line.lineTo(x,y):line.moveTo(x,y); }
+    const fill=new Path2D(line); fill.lineTo(W,H); fill.lineTo(0,H); fill.closePath();
+    ctx.fillStyle=`rgb(${lerp(20,64,t)},${lerp(22,72,t)},${lerp(25,84,t)})`; ctx.fill(fill);
+    ctx.strokeStyle=`rgba(255,255,255,${0.4+0.55*t})`; ctx.lineWidth=b===nb-1?1.8:1.2; ctx.stroke(line);
+  }
+  // etiquetas de picos
+  const vis=[]; let top=H;
+  for(const p of peaks){
+    const dx=wrap(p.az-yaw); if(Math.abs(dx)>fov/2+2) continue;
+    const x=W/2+dx*ppd; if(vis.some(q=>Math.abs(q.x-x)<17)) continue;
+    const y=yOf(p.ang); vis.push({x,y,p}); top=Math.min(top,y); if(vis.length>=70) break;
+  }
+  const base=Math.max(140,top-28);
+  ctx.textAlign='left'; ctx.textBaseline='alphabetic';
+  for(const {x,y,p} of vis){
+    ctx.strokeStyle='rgba(255,255,255,.55)'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(x,y-3); ctx.lineTo(x,base); ctx.stroke();
+    ctx.save(); ctx.translate(x,base); ctx.rotate(rad(-55));
+    ctx.fillStyle='#fff'; ctx.font='600 13px "Segoe UI",system-ui,sans-serif';
+    const nom=p.nombre.length>24?p.nombre.slice(0,23)+'…':p.nombre; ctx.fillText(nom,6,-3);
+    ctx.fillStyle='#b9b9c0'; ctx.font='10px "Segoe UI",system-ui,sans-serif';
+    ctx.fillText(p.ele+' m',6+ctx.measureText(nom).width*1.25+4,-3);
+    ctx.restore();
+  }
+  // escala de rumbos
+  const paso=fov>180?30:fov>90?10:fov>40?5:fov>15?2:1, lab=fov>40?10:5;
+  ctx.strokeStyle='#777'; ctx.fillStyle='#bbb'; ctx.font='11px system-ui'; ctx.textAlign='center'; ctx.lineWidth=1;
+  for(let a=Math.ceil(az0/paso)*paso;a<=yaw+fov/2;a+=paso){
+    const x=W/2+(a-yaw)*ppd, m=mod(a); ctx.beginPath(); ctx.moveTo(x,H-32); ctx.lineTo(x,H-(m%lab===0?24:28)); ctx.stroke();
+    if(m%lab===0) ctx.fillText(Math.round(m)+'°',x,H-10);
+  }
+  ctx.fillStyle='#f2c200'; ctx.font='700 14px system-ui';
+  for(const [n,a] of MARCAS){ const dx=wrap(a-yaw); if(Math.abs(dx)<=fov/2) ctx.fillText(n,W/2+dx*ppd,H-38); }
+  // brújula
+  const cx=W-44, cy=44, r=26;
+  ctx.fillStyle='rgba(20,20,22,.85)'; ctx.beginPath(); ctx.arc(cx,cy,r+6,0,7); ctx.fill();
+  const cono=Math.min(fov,359); ctx.fillStyle='rgba(0,170,230,.8)'; ctx.beginPath(); ctx.moveTo(cx,cy);
+  ctx.arc(cx,cy,r,rad(-90-cono/2),rad(-90+cono/2)); ctx.closePath(); ctx.fill();
+  ctx.fillStyle='#f2c200'; ctx.font='700 12px system-ui'; ctx.textBaseline='middle';
+  ctx.fillText('N',cx+(r-2)*Math.sin(rad(-yaw)),cy-(r-2)*Math.cos(rad(-yaw)));
+  ctx.fillStyle='#fff'; ctx.textBaseline='alphabetic'; ctx.font='12px system-ui'; ctx.fillText(Math.round(mod(yaw))+'°',cx,cy+r+22);
+}
+
+/* ---------- Modo cámara (realidad aumentada) ---------- */
+let cam=false, sensor=false, stream=null, Rs=null, offI=null, myaw=0, mpitch=0, evName='';
+function rumboDeCamara(al,be,ga){
+  const cA=Math.cos(rad(al)),sA=Math.sin(rad(al)),cB=Math.cos(rad(be)),sB=Math.sin(rad(be)),cG=Math.cos(rad(ga)),sG=Math.sin(rad(ga));
+  return mod(deg(Math.atan2(-cA*sG-sA*sB*cG,-sA*sG+cA*sB*cG)));
+}
+// Matriz de rotación dispositivo→Tierra (E,N,arriba) a partir de los ángulos de Euler del W3C; se suaviza y se reortonormaliza
+function fijaOri(al,be,ga){
+  al-=+$('hoff').value;
+  const cA=Math.cos(rad(al)),sA=Math.sin(rad(al)),cB=Math.cos(rad(be)),sB=Math.sin(rad(be)),cG=Math.cos(rad(ga)),sG=Math.sin(rad(ga));
+  const R=[cA*cG-sA*sB*sG,-sA*cB,cA*sG+sA*sB*cG, sA*cG+cA*sB*sG,cA*cB,sA*sG-cA*sB*cG, -cB*sG,sB,cB*cG];
+  if(!Rs) Rs=R; else for(let i=0;i<9;i++) Rs[i]=Rs[i]*0.75+R[i]*0.25;
+  let c3=[Rs[2],Rs[5],Rs[8]], c2=[Rs[1],Rs[4],Rs[7]];
+  const n3=Math.hypot(...c3); c3=c3.map(v=>v/n3);
+  const d=c2[0]*c3[0]+c2[1]*c3[1]+c2[2]*c3[2]; c2=c2.map((v,i)=>v-d*c3[i]);
+  const n2=Math.hypot(...c2); c2=c2.map(v=>v/n2);
+  const c1=[c2[1]*c3[2]-c2[2]*c3[1],c2[2]*c3[0]-c2[0]*c3[2],c2[0]*c3[1]-c2[1]*c3[0]];
+  Rs=[c1[0],c2[0],c3[0],c1[1],c2[1],c3[1],c1[2],c2[2],c3[2]];
+}
+function alOrientar(e){
+  let a=e.alpha; if(a==null||e.beta==null) return;
+  if(e.webkitCompassHeading!=null){                       // iOS: alpha es relativo, se ancla a la brújula
+    const dl=wrap(e.webkitCompassHeading-rumboDeCamara(a,e.beta,e.gamma));
+    offI=offI===null?dl:offI+0.1*wrap(dl-offI); a-=offI;
+  }
+  sensor=true; fijaOri(a,e.beta,e.gamma);
+}
+async function iniciarCam(){
+  if(!sky) return msg('Primero calcula el panorama.');
+  try{
+    if(typeof DeviceOrientationEvent!=='undefined'&&DeviceOrientationEvent.requestPermission){
+      if(await DeviceOrientationEvent.requestPermission()!=='granted') throw new Error('permiso de sensores denegado');
+    }
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280}},audio:false});
+  }catch(e){ return msg('Cámara o sensores: '+e.message+' (hace falta HTTPS o localhost)'); }
+  $('vid').srcObject=stream; $('vid').style.display='block'; $('camui').hidden=false; $('zoom').style.display='none';
+  $('panel').open=false; cam=true; sensor=false; Rs=null; offI=null;
+  evName='ondeviceorientationabsolute' in window?'deviceorientationabsolute':'deviceorientation';
+  addEventListener(evName,alOrientar,true);
+  setTimeout(()=>{ if(cam&&!sensor){ myaw=mod(yaw); mpitch=0; Rs=null; fijaOri(360-myaw,90,0); } },1500);   // sin sensores: modo manual
+  (function bucle(){ if(!cam) return; dibujarAR(); requestAnimationFrame(bucle); })();
+}
+function salirCam(){
+  cam=false; removeEventListener(evName,alOrientar,true);
+  stream?.getTracks().forEach(t=>t.stop()); stream=null;
+  $('vid').style.display='none'; $('camui').hidden=true; $('zoom').style.display=''; $('panel').open=true; dibujar();
+}
+$('camb').onclick=iniciarCam; $('salir').onclick=salirCam;
+
+function dibujarAR(){
+  const dpr=devicePixelRatio||1, W=cv.clientWidth, H=cv.clientHeight;
+  if(cv.width!==Math.round(W*dpr)||cv.height!==Math.round(H*dpr)){cv.width=Math.round(W*dpr);cv.height=Math.round(H*dpr);}
+  ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,W,H);
+  if(!Rs||!sky) return;
+  const m=Rs, f=(H/2)/Math.tan(rad(+$('fov').value/2));
+  const proj=(az,el)=>{                                    // (azimut, elevación) → píxel de pantalla
+    const ce=Math.cos(rad(el)), E=ce*Math.sin(rad(az)), Nn=ce*Math.cos(rad(az)), U=Math.sin(rad(el));
+    const xd=m[0]*E+m[3]*Nn+m[6]*U, yd=m[1]*E+m[4]*Nn+m[7]*U, dep=-(m[2]*E+m[5]*Nn+m[8]*U);
+    return dep>0.05?[W/2+xd/dep*f,H/2-yd/dep*f]:null;
+  };
+  const camAz=deg(Math.atan2(-m[2],-m[5])), pitch=deg(Math.asin(clamp(-m[8],-1,1)));
+  const i0=Math.round((camAz-85)/STEP), cnt=Math.round(170/STEP);
+  ctx.lineJoin='round'; ctx.shadowColor='rgba(0,0,0,.85)'; ctx.shadowBlur=3;
+  // horizonte geométrico (referencia para calibrar inclinación)
+  ctx.setLineDash([6,6]); ctx.strokeStyle='rgba(242,194,0,.7)'; ctx.lineWidth=1; ctx.beginPath();
+  let pen=false;
+  for(let a=camAz-85;a<=camAz+85;a+=2){ const q=proj(a,0); if(q){pen?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]);pen=true;}else pen=false; }
+  ctx.stroke(); ctx.setLineDash([]);
+  // siluetas del relieve por bandas de distancia
+  const nb=sky.length;
+  for(let b=0;b<nb;b++){
+    const t=b/Math.max(1,nb-1); ctx.beginPath(); pen=false;
+    for(let k=0;k<cnt;k+=2){
+      const i=(((i0+k)%N)+N)%N, q=proj(i*STEP,sky[b][i]);
+      if(q){pen?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]);pen=true;}else pen=false;
+    }
+    ctx.strokeStyle=`rgba(255,255,255,${0.35+0.6*t})`; ctx.lineWidth=b===nb-1?2.2:1.4; ctx.stroke();
+  }
+  // picos
+  const vis=[]; let top=H;
+  for(const p of peaks){
+    const q=proj(p.az,p.ang); if(!q||q[0]<-10||q[0]>W+10||q[1]<-10||q[1]>H+10) continue;
+    if(vis.some(v=>Math.abs(v.x-q[0])<20)) continue;
+    vis.push({x:q[0],y:q[1],p}); top=Math.min(top,q[1]); if(vis.length>=40) break;
+  }
+  const base=Math.max(130,Math.min(H*0.45,top-34));
+  ctx.textAlign='left'; ctx.textBaseline='alphabetic';
+  for(const {x,y,p} of vis){
+    ctx.strokeStyle='rgba(255,255,255,.7)'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(x,y-3); ctx.lineTo(x,base); ctx.stroke();
+    ctx.fillStyle='#f2c200'; ctx.beginPath(); ctx.arc(x,y,3.5,0,7); ctx.fill();
+    ctx.save(); ctx.translate(x,base); ctx.rotate(rad(-55));
+    ctx.fillStyle='#fff'; ctx.font='600 13px "Segoe UI",system-ui,sans-serif';
+    const nom=p.nombre.length>24?p.nombre.slice(0,23)+'…':p.nombre; ctx.fillText(nom,6,-3);
+    ctx.fillStyle='#d4d4da'; ctx.font='10px "Segoe UI",system-ui,sans-serif';
+    ctx.fillText(p.ele+' m · '+(p.d/1000).toFixed(0)+' km',6+ctx.measureText(nom).width*1.25+4,-3);
+    ctx.restore();
+  }
+  ctx.shadowBlur=0; ctx.fillStyle='rgba(20,20,22,.7)'; ctx.fillRect(8,8,sensor?205:300,24);
+  ctx.fillStyle='#fff'; ctx.font='12px system-ui';
+  ctx.fillText(sensor?`Rumbo ${Math.round(mod(camAz))}° · inclinación ${Math.round(pitch)}°`:'Sin sensores: arrastra para orientar la vista',14,25);
+}
+
+/* ---------- Interacción: arrastre, rueda, pellizco y teclado ---------- */
+const ptr=new Map(); let d0=1,f0=60;
+const dd=()=>{const [a,b]=[...ptr.values()]; return Math.hypot(a[0]-b[0],a[1]-b[1])||1;};
+cv.onpointerdown=e=>{cv.setPointerCapture(e.pointerId); ptr.set(e.pointerId,[e.clientX,e.clientY]); if(ptr.size===2){d0=dd();f0=fov;}};
+cv.onpointermove=e=>{
+  if(!ptr.has(e.pointerId)) return; const p=ptr.get(e.pointerId);
+  if(cam){
+    if(!sensor&&ptr.size===1){ myaw=mod(myaw-(e.clientX-p[0])*0.15); mpitch=clamp(mpitch+(e.clientY-p[1])*0.1,-80,80); Rs=null; fijaOri(360-myaw,90+mpitch,0); }
+    ptr.set(e.pointerId,[e.clientX,e.clientY]); return;
+  }
+  if(ptr.size===1){ yaw=mod(yaw-(e.clientX-p[0])*fov/cv.clientWidth); offY+=e.clientY-p[1]; }
+  ptr.set(e.pointerId,[e.clientX,e.clientY]);
+  if(ptr.size===2) fov=clamp(f0*d0/dd(),8,360);
+  dibujar();
+};
+cv.onpointerup=cv.onpointercancel=e=>ptr.delete(e.pointerId);
+cv.onwheel=e=>{e.preventDefault(); fov=clamp(fov*Math.exp(e.deltaY*0.001),8,360); dibujar();};
+$('zi').onclick=()=>{fov=clamp(fov/1.4,8,360);dibujar();};
+$('zo').onclick=()=>{fov=clamp(fov*1.4,8,360);dibujar();};
+addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return;
+  if(e.key==='ArrowLeft') yaw=mod(yaw-fov/20); else if(e.key==='ArrowRight') yaw=mod(yaw+fov/20);
+  else if(e.key==='+') fov=clamp(fov/1.2,8,360); else if(e.key==='-') fov=clamp(fov*1.2,8,360); else return;
+  dibujar();
+});
+$('exa').oninput=dibujar;
+new ResizeObserver(dibujar).observe(cv);
+dibujar();
+</script>
+</body>
+</html>
