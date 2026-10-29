@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Reconocedor de objetos</title>
+<style>
+:root{--bg:#141416;--pn:rgba(22,22,25,.88);--ln:#3a3a3f;--fg:#ececec;--mut:#a0a0a8;--ac:#f2c200;--cy:#00e0ff}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:15px/1.4 "Segoe UI",system-ui,sans-serif;overflow:hidden}
+#vid,#foto{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+#foto{display:none}
+#top{position:absolute;left:0;right:0;top:0;padding:calc(8px + env(safe-area-inset-top)) 12px 8px;background:linear-gradient(#000a,#0000);font-size:13px;color:#fff}
+#guia{position:absolute;left:50%;top:38%;width:min(68vw,44vh);aspect-ratio:1;transform:translate(-50%,-50%);
+  border:2px solid rgba(255,255,255,.35);border-radius:14px;box-shadow:0 0 0 9999px rgba(0,0,0,.28)}
+#guia.ok{border-color:var(--cy)}
+#etq{position:absolute;left:50%;bottom:calc(100% + 8px);transform:translateX(-50%);white-space:nowrap;background:rgba(0,0,0,.72);
+  color:#fff;border-left:4px solid var(--cy);border-radius:8px;padding:5px 10px;font-weight:600;display:none}
+#tarjeta{position:absolute;left:10px;right:10px;bottom:calc(76px + env(safe-area-inset-bottom));max-height:42vh;overflow:auto;
+  background:var(--pn);border:1px solid var(--ln);border-radius:14px;padding:12px 14px;backdrop-filter:blur(8px);display:none}
+#tarjeta h2{margin:0 0 6px;font-size:18px}
+.sub{color:var(--mut);font-size:13px}
+.barra{height:6px;background:#333;border-radius:3px;margin:6px 0 8px;overflow:hidden}
+.barra i{display:block;height:100%;background:var(--cy)}
+ul{margin:6px 0 0;padding-left:18px}
+li{margin:3px 0}
+#ctl{position:absolute;left:0;right:0;bottom:0;display:flex;gap:8px;align-items:center;justify-content:center;flex-wrap:wrap;
+  padding:10px 10px calc(10px + env(safe-area-inset-bottom));background:linear-gradient(#0000,#000b)}
+button,label.btn{background:var(--ac);color:#1a1500;border:0;border-radius:10px;padding:11px 16px;font:inherit;font-weight:700;cursor:pointer}
+button.sec,label.btn.sec{background:rgba(30,30,34,.9);color:var(--fg);border:1px solid var(--ln);font-weight:600}
+button:disabled{opacity:.45}
+label.chk{color:#fff;font-size:13px;display:flex;gap:6px;align-items:center}
+</style>
+</head>
+<body>
+<video id="vid" playsinline muted autoplay></video>
+<img id="foto" alt="">
+<div id="top"><b>Reconocedor</b> · <span id="estado">Cargando modelo…</span></div>
+<div id="guia"><div id="etq"></div></div>
+<div id="tarjeta"></div>
+<div id="ctl">
+  <button id="cam">Iniciar cámara</button>
+  <button id="ident" disabled>Identificar</button>
+  <label class="chk"><input type="checkbox" id="cont"> Continuo</label>
+  <label class="btn sec">Foto<input id="arch" type="file" accept="image/*" hidden></label>
+</div>
+
+<script type="module">
+// Se usa @3 para tomar la última versión 3.x; cuando todo funcione conviene fijar una versión exacta.
+import {AutoTokenizer,CLIPTextModelWithProjection,AutoProcessor,CLIPVisionModelWithProjection,RawImage}
+  from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3';
+
+/* ---------- Catálogo editable ----------
+   cat: grupo al que pertenece. prompt: frase en inglés que CLIP compara con la imagen.
+   Para añadir una pieza nueva basta con agregar una línea en ITEMS (y sus datos, si quieres). */
+const CATS={
+  transformer:{es:'Transformer',datos:[
+    'Franquicia de Hasbro y Takara Tomy iniciada en 1984.',
+    'Dos facciones principales: Autobots y Decepticons.',
+    'Cada figura se transforma entre un modo vehículo (o animal) y un modo robot.',
+    'Las líneas se clasifican por tamaño: Legion, Deluxe, Voyager, Leader.']},
+  escala:{es:'Auto a escala',datos:[
+    'La escala es la proporción con el auto real. Para uno de 4.5 m: 1:64 mide unos 7 cm, 1:43 unos 10 cm, 1:24 unos 19 cm y 1:18 unos 25 cm.',
+    'Los modelos «die-cast» se hacen de aleación de zinc (zamak) con piezas de plástico.',
+    'Marcas comunes: Hot Wheels (Mattel, 1968), Matchbox (1953), Majorette, Tomica, Greenlight, Maisto, Bburago y Minichamps.']},
+  real:{es:'Auto real',datos:[
+    'Parece un auto de tamaño real, no un modelo.',
+    'Si es un modelo a escala, acércalo a la cámara hasta que llene el recuadro.']},
+  otro:{es:'Otro objeto',datos:['Este objeto no está en el catálogo; puedes añadirlo en ITEMS.']}
+};
+const ITEMS=[
+  {cat:'transformer',es:'Transformer (robot de juguete)',prompt:'a photo of a Transformers robot toy'},
+  {cat:'transformer',es:'Optimus Prime',personaje:1,prompt:'a photo of an Optimus Prime Transformers toy',
+    datos:['Líder de los Autobots.','Su modo alterno clásico es un tractocamión.','Aparece desde la serie original de 1984.']},
+  {cat:'transformer',es:'Bumblebee',personaje:1,prompt:'a photo of a Bumblebee Transformers toy',
+    datos:['Autobot pequeño y rápido, de color amarillo.','Su modo alterno es un Volkswagen Beetle en la serie original y un Chevrolet Camaro en las películas.']},
+  {cat:'transformer',es:'Megatron',personaje:1,prompt:'a photo of a Megatron Transformers toy',
+    datos:['Líder de los Decepticons.','En la serie original se transforma en una pistola; en otras versiones, en tanque o aeronave.']},
+  {cat:'transformer',es:'Starscream',personaje:1,prompt:'a photo of a Starscream Transformers toy',
+    datos:['Decepticon, comandante aéreo.','Su modo alterno clásico es un jet de combate.']},
+  {cat:'transformer',es:'Soundwave',personaje:1,prompt:'a photo of a Soundwave Transformers toy',
+    datos:['Decepticon especializado en comunicaciones e inteligencia.','Su modo alterno clásico es un reproductor de casetes.']},
+  {cat:'escala',es:'Auto a escala (coleccionable)',prompt:'a photo of a small die-cast model car'},
+  {cat:'escala',es:'Auto de juguete (tipo Hot Wheels o Matchbox)',prompt:'a photo of a Hot Wheels or Matchbox toy car'},
+  {cat:'escala',es:'Auto a escala grande',prompt:'a photo of a large collectible model car'},
+  {cat:'real',es:'Auto real',prompt:'a photo of a real car on the street'},
+  {cat:'otro',es:'Figura de acción (otra)',prompt:'a photo of an action figure'},
+  {cat:'otro',es:'Juguete',prompt:'a photo of a toy'},
+  {cat:'otro',es:'Persona',prompt:'a photo of a person'},
+  {cat:'otro',es:'Mano',prompt:'a photo of a hand'},
+  {cat:'otro',es:'Computadora',prompt:'a photo of a laptop computer'},
+  {cat:'otro',es:'Teléfono',prompt:'a photo of a smartphone'},
+  {cat:'otro',es:'Planta',prompt:'a photo of a plant'},
+  {cat:'otro',es:'Taza o vaso',prompt:'a photo of a cup'},
+  {cat:'otro',es:'Libro',prompt:'a photo of a book'},
+  {cat:'otro',es:'Perro o gato',prompt:'a photo of a pet animal'},
+  {cat:'otro',es:'Mueble',prompt:'a photo of furniture'},
+  {cat:'otro',es:'Edificio',prompt:'a photo of a building'},
+  {cat:'otro',es:'Mesa o superficie vacía',prompt:'a photo of an empty table'}
+];
+
+/* ---------- Utilidades ---------- */
+const $=id=>document.getElementById(id), esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const estado=t=>$('estado').textContent=t, dormir=ms=>new Promise(r=>setTimeout(r,ms));
+let tok,tm,proc,vm,TE=null,D=512,listo=false,cam=false,busy=false,hist=[];
+
+/* ---------- Modelo CLIP en el navegador (clasificación sin entrenamiento) ---------- */
+async function cargar(){
+  try{
+    const id='Xenova/clip-vit-base-patch32';
+    const o={dtype:'q8',progress_callback:p=>{ if(p.status==='progress') estado(`Descargando modelo… ${Math.round(p.progress)} %`); }};
+    tok=await AutoTokenizer.from_pretrained(id);
+    tm=await CLIPTextModelWithProjection.from_pretrained(id,o);
+    proc=await AutoProcessor.from_pretrained(id);
+    vm=await CLIPVisionModelWithProjection.from_pretrained(id,o);
+    estado('Preparando catálogo…');
+    const {text_embeds}=await tm(tok(ITEMS.map(i=>i.prompt),{padding:true,truncation:true}));
+    TE=text_embeds.normalize(2,1).data; D=text_embeds.dims[1];      // los textos se codifican una sola vez
+    listo=true; estado(cam?'Listo: encuadra un objeto':'Modelo listo: inicia la cámara'); $('ident').disabled=!cam;
+  }catch(e){ estado('No se pudo cargar el modelo: '+e.message); }
+}
+async function clasificar(cv){
+  const {image_embeds}=await vm(await proc(RawImage.fromCanvas(cv)));
+  const e=image_embeds.normalize(2,1).data, n=ITEMS.length, lg=new Float32Array(n);
+  for(let i=0;i<n;i++){ let s=0; for(let k=0;k<D;k++) s+=e[k]*TE[i*D+k]; lg[i]=100*s; }
+  const m=Math.max(...lg); let z=0; const p=Array.from(lg,v=>{const x=Math.exp(v-m); z+=x; return x;});
+  return p.map(x=>x/z);                                              // softmax
+}
+function resumen(p){
+  const masa={}; ITEMS.forEach((it,i)=>masa[it.cat]=(masa[it.cat]||0)+p[i]);
+  const cat=Object.keys(masa).sort((a,b)=>masa[b]-masa[a])[0];
+  const ord=ITEMS.map((it,i)=>({it,p:p[i]})).sort((a,b)=>b.p-a.p);
+  const dentro=ord.filter(x=>x.it.cat===cat), top=dentro[0];
+  return {cat,conf:cat==='otro'?top.p:masa[cat],mejor:top.it,pDentro:top.p/masa[cat],alt:ord.slice(0,3)};
+}
+
+/* ---------- Captura del recuadro guía ---------- */
+const c224=document.createElement('canvas'); c224.width=c224.height=224;
+function recorte(){
+  const el=$('foto').style.display==='block'?$('foto'):$('vid');
+  const vw=el.videoWidth||el.naturalWidth, vh=el.videoHeight||el.naturalHeight; if(!vw) return null;
+  const b=el.getBoundingClientRect(), g=$('guia').getBoundingClientRect(), s=Math.max(b.width/vw,b.height/vh);
+  const sx=(g.left-b.left+(vw*s-b.width)/2)/s, sy=(g.top-b.top+(vh*s-b.height)/2)/s, sw=g.width/s;
+  c224.getContext('2d').drawImage(el,sx,sy,sw,sw,0,0,224,224);
+  return c224;
+}
+
+/* ---------- Resultado ---------- */
+function mostrar(r){
+  const dudoso=r.conf<0.45, tar=$('tarjeta'), etq=$('etq');
+  let titulo=dudoso?'No estoy seguro':(r.cat==='otro'?r.mejor.es:CATS[r.cat].es), html='';
+  const pct=Math.round(r.conf*100);
+  html+=`<h2>${esc(titulo)}</h2><div class="barra"><i style="width:${pct}%"></i></div><div class="sub">Confianza ${pct} %</div>`;
+  if(!dudoso){
+    if(r.cat==='transformer'||r.cat==='escala'){
+      const esP=r.mejor.personaje&&r.pDentro>0.5;
+      html+=`<p><b>${esP?'Personaje probable':'Tipo'}:</b> ${esc(r.mejor.es)}${esP?` <span class="sub">(${Math.round(r.pDentro*100)} %)</span>`:''}</p>`;
+      const d=[...(esP&&r.mejor.datos?r.mejor.datos:[]),...CATS[r.cat].datos];
+      html+='<ul>'+d.map(x=>`<li>${esc(x)}</li>`).join('')+'</ul>';
+    }else{
+      const d=r.mejor.datos||CATS[r.cat].datos; html+='<ul>'+d.map(x=>`<li>${esc(x)}</li>`).join('')+'</ul>';
+    }
+  }else{
+    html+='<p class="sub">Acerca el objeto, mejora la luz o encuádralo mejor dentro del recuadro.</p>';
+  }
+  html+=`<p class="sub">Más probables: ${r.alt.map(a=>`${esc(a.it.es)} ${Math.round(a.p*100)} %`).join(' · ')}</p>`;
+  tar.innerHTML=html; tar.style.display='block';
+  etq.textContent=`${titulo}${dudoso?'':' · '+pct+' %'}`; etq.style.display='block'; $('guia').classList.toggle('ok',!dudoso);
+}
+async function identificar(){
+  if(!listo||busy) return;
+  const c=recorte(); if(!c) return estado('Inicia la cámara o carga una foto.');
+  busy=true;
+  try{
+    hist.push(await clasificar(c)); if(hist.length>3) hist.shift();       // promedio de los últimos 3 cuadros
+    mostrar(resumen(hist[0].map((_,i)=>hist.reduce((a,h)=>a+h[i],0)/hist.length)));
+  }catch(e){ estado('Error al analizar: '+e.message); }
+  busy=false;
+}
+async function bucle(){ while($('cont').checked&&cam){ await identificar(); await dormir(250); } }
+
+/* ---------- Controles ---------- */
+$('cam').onclick=async()=>{
+  try{
+    const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280}},audio:false});
+    $('vid').srcObject=s; $('vid').style.display='block'; $('foto').style.display='none'; cam=true;
+    $('cam').style.display='none'; $('ident').disabled=!listo; estado(listo?'Listo: encuadra un objeto':'Cargando modelo…');
+  }catch(e){ estado('Cámara: '+e.message+' (hace falta HTTPS o localhost)'); }
+};
+$('ident').onclick=()=>{ hist=[]; identificar(); };
+$('cont').onchange=()=>{ hist=[]; bucle(); };
+$('arch').onchange=e=>{
+  const f=e.target.files[0]; if(!f) return;
+  const im=$('foto'); im.onload=()=>{ im.style.display='block'; $('vid').style.display='none'; hist=[]; $('ident').disabled=!listo; identificar(); };
+  im.src=URL.createObjectURL(f);
+};
+cargar();
+</script>
+</body>
+</html>
